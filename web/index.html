@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>APK Signer</title>
+  <meta name="description" content="Sign an APK with the Android debug key, right in your browser.">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main class="card">
+    <header class="head">
+      <img src="icon.svg" alt="" width="40" height="40">
+      <div>
+        <h1>APK Signer</h1>
+        <p>Signs with the Android debug key</p>
+      </div>
+    </header>
+
+    <div id="box" class="box" data-view="empty" role="button" tabindex="0" aria-label="Choose an APK to sign">
+      <img class="glyph" src="icon.svg" alt="">
+      <div id="view-empty" class="view">
+        <p class="title">Drop an APK here</p>
+        <p class="meta">or click to browse</p>
+      </div>
+      <div id="view-ready" class="view" hidden>
+        <p id="ready-name" class="title"></p>
+        <p id="ready-meta" class="meta"></p>
+        <p id="ready-hint" class="hint">Drop another APK or click to change</p>
+        <div id="progress" class="progress" hidden>
+          <div class="track"><div id="progress-bar" class="bar"></div></div>
+          <p id="progress-label" class="hint">Signing...</p>
+        </div>
+      </div>
+      <div id="view-done" class="view" hidden>
+        <p class="headline">Signed successfully</p>
+        <p id="done-name" class="title"></p>
+        <p id="done-meta" class="meta"></p>
+      </div>
+    </div>
+    <input id="picker" type="file" accept=".apk" hidden>
+
+    <footer class="actions">
+      <p id="status" class="status" role="status"></p>
+      <a id="again" class="again" href="#" hidden>Download again</a>
+      <button id="sign" type="button" class="primary" disabled>Sign</button>
+      <button id="another" type="button" class="primary" hidden>Sign another APK</button>
+    </footer>
+    <p class="more"><a href="https://github.com/daniel-grabczewski/apk-signer">Windows app and source on GitHub</a></p>
+  </main>
+</body>
+</html>

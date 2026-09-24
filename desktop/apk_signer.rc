@@ -1,0 +1,52 @@
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+IDI_APP          ICON    "res\\app.ico"
+IDR_PRIVATE_KEY  RCDATA  "res\\debug.pk8"
+IDR_CERTIFICATE  RCDATA  "res\\debug.cer"
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+IDD_MAIN DIALOGEX 0, 0, 280, 146
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+EXSTYLE WS_EX_ACCEPTFILES | WS_EX_APPWINDOW
+CAPTION "APK Signer"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    CONTROL         "", IDC_DROP, "Button", BS_OWNERDRAW | WS_TABSTOP, 8, 8, 264, 100
+    CONTROL         "", IDC_STATUS, "Static", SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS | SS_NOPREFIX | WS_GROUP, 8, 122, 196, 10
+    CONTROL         "<a>Show in folder</a>", IDC_LINK, "SysLink", WS_TABSTOP | LWS_TRANSPARENT | NOT WS_VISIBLE, 8, 122, 120, 10
+    PUSHBUTTON      "Sign &another APK", IDC_ANOTHER, 186, 116, 86, 22, NOT WS_VISIBLE
+    DEFPUSHBUTTON   "&Sign", IDOK, 212, 116, 60, 22, WS_DISABLED
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "APK Signer"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "APK Signer"
+            VALUE "OriginalFilename", "APK-Signer.exe"
+            VALUE "ProductName", "APK Signer"
+            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "Comments", "Signs APKs with the Android debug key. https://github.com/daniel-grabczewski/apk-signer"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

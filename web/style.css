@@ -1,0 +1,139 @@
+:root {
+  color-scheme: light dark;
+  --page: #eef0f2;
+  --card: #ffffff;
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 12px 32px rgb(0 0 0 / 0.08);
+  --ink: #1b1f23;
+  --muted: #5c6166;
+  --faint: #868b91;
+  --dash: #a3a8ad;
+  --hover: #f4f8f5;
+  --green: #2ea44f;
+  --green-button: #1a7f37;
+  --green-ink: #107c10;
+  --green-tint: #edf7f0;
+  --track: #dcefe2;
+  --error: #c42b1c;
+  --link: #0f6cbd;
+  --disabled: #e4e6e8;
+  --disabled-ink: #9aa0a6;
+  --focus: rgb(46 164 79 / 0.45);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #16181b;
+    --card: #23262a;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 32px rgb(0 0 0 / 0.35);
+    --ink: #eef0f2;
+    --muted: #b4b9be;
+    --faint: #8d9399;
+    --dash: #5d636a;
+    --hover: #282d2a;
+    --green: #3fb950;
+    --green-button: #238636;
+    --green-ink: #56d364;
+    --green-tint: #1b2e22;
+    --track: #1f3a28;
+    --error: #ff8a80;
+    --link: #6cb6ff;
+    --disabled: #33373c;
+    --disabled-ink: #7d838a;
+    --focus: rgb(63 185 80 / 0.5);
+  }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+  background: var(--page);
+  color: var(--ink);
+  font: 15px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+.card {
+  width: 100%;
+  max-width: 560px;
+  padding: 20px;
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.head { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.head h1 { margin: 0; font-size: 20px; font-weight: 600; line-height: 1.2; }
+.head p { margin: 2px 0 0; font-size: 13px; color: var(--muted); }
+
+.box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 250px;
+  padding: 28px 20px;
+  border: 2px dashed var(--dash);
+  border-radius: 12px;
+  background: var(--card);
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+.box:hover { background: var(--hover); }
+.box:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+.box[data-view="ready"] { border-style: solid; border-color: var(--green); }
+.box[data-view="done"] { border-style: solid; border-color: var(--green); background: var(--green-tint); cursor: default; }
+.box.busy { cursor: progress; }
+.box.over { border-color: var(--green); background: var(--hover); }
+
+.glyph { width: 48px; height: 48px; margin-bottom: 12px; }
+.box[data-view="done"] .glyph { width: 60px; height: 60px; }
+
+.view { width: 100%; }
+.view p { margin: 0; }
+.view .title { font-size: 18px; font-weight: 600; overflow-wrap: anywhere; }
+.view .headline { margin-bottom: 4px; font-size: 26px; font-weight: 600; color: var(--green-ink); }
+.view .meta { margin-top: 4px; font-size: 14px; color: var(--muted); }
+.view .hint { margin-top: 12px; font-size: 13px; color: var(--faint); }
+
+.progress { width: min(320px, 100%); margin: 16px auto 0; }
+.track { height: 6px; overflow: hidden; border-radius: 3px; background: var(--track); }
+.bar { width: 0; height: 100%; border-radius: 3px; background: var(--green); transition: width 0.12s linear; }
+
+.actions { display: flex; align-items: center; gap: 12px; min-height: 42px; margin-top: 16px; }
+.status { flex: 1; margin: 0; font-size: 13px; color: var(--muted); }
+.status.error { color: var(--error); }
+.again { flex: 1; font-size: 14px; color: var(--link); }
+
+.primary {
+  min-width: 120px;
+  padding: 10px 22px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--green-button);
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.primary:hover:not(:disabled) { filter: brightness(1.1); }
+.primary:disabled { background: var(--disabled); color: var(--disabled-ink); cursor: default; }
+.primary:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+.more { margin: 16px 0 0; text-align: center; font-size: 12px; }
+.more a { color: var(--faint); }
+.more a:hover { color: var(--link); }
+
+@media (max-width: 480px) {
+  .card { padding: 16px; }
+  .box { min-height: 220px; padding: 24px 14px; }
+  .view .headline { font-size: 22px; }
+}

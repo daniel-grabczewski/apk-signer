@@ -1,0 +1,6 @@
+* text=auto
+*.cmd text eol=crlf
+*.ico binary
+*.pk8 binary
+*.cer binary
+*.keystore binary
