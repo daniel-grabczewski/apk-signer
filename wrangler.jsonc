@@ -1,0 +1,9 @@
+// Cloudflare deploys web/ as a static site (a Worker with static assets and no script).
+// web/_headers sets the security headers.
+{
+  "name": "apk-signer",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./web"
+  }
+}

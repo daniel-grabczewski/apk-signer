@@ -61,8 +61,9 @@ selftest inspect <file>
 `DecompressionStream`, so it works in current Chrome, Edge, Firefox and Safari.
 
 - **Preview:** `python tools/dev_server.py`, then open http://localhost:8253.
-- **Cloudflare Pages:** connect this repository, leave the build command empty and set the build
-  output directory to `web`. `web/_headers` adds a strict Content-Security-Policy.
+- **Cloudflare:** `wrangler.jsonc` deploys `web/` as a static site. Connect this repository in
+  Workers & Pages, leave the build command empty and keep the default deploy command,
+  `npx wrangler deploy`. `web/_headers` adds a strict Content-Security-Policy.
 
 ## Changing the key
 
