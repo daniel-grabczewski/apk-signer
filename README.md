@@ -2,8 +2,9 @@
 
 Sign an Android APK with the Android debug key, in two forms:
 
-- **Web:** open the page, drop an APK on it, press **Sign**, and the signed APK downloads. It runs
-  entirely in your browser; the APK is never uploaded anywhere.
+- **Web:** [apk-signer.pages.dev](https://apk-signer.pages.dev). Drop an APK on the page, press
+  **Sign**, and the signed APK downloads. It runs entirely in your browser; the APK is never
+  uploaded anywhere.
 - **Windows:** [`APK-Signer.exe`](https://github.com/daniel-grabczewski/apk-signer/releases/latest),
   one native file of about 310 KB with no installer and no runtimes. Drop an APK on the window,
   press **Sign**, and choose where to save.
