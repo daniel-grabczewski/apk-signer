@@ -6,10 +6,11 @@ Sign an Android APK with the Android debug key, in two forms:
   **Sign**, and the signed APK downloads. It runs entirely in your browser; the APK is never
   uploaded anywhere.
 - **Windows:** [`APK-Signer.exe`](https://github.com/daniel-grabczewski/apk-signer/releases/latest),
-  one native file of about 310 KB with no installer and no runtimes. Drop an APK on the window,
+  one native file of about 340 KB with no installer and no runtimes. Drop an APK on the window,
   press **Sign**, and choose where to save.
 
-Either way the signed file is named `<name>-SIGNED.apk`.
+Either way the signed file is named `<name>-SIGNED.apk`. Tick **Separate copy** first to get an APK
+that installs alongside the original instead of over it (see [Separate copies](#separate-copies)).
 
 ## What it writes
 
@@ -20,9 +21,35 @@ The same as Google's `apksigner` with v1 and v2 enabled:
 - zip alignment: 4 bytes for uncompressed files and 16 KB for uncompressed native libraries.
 
 Everything else in the APK is kept byte for byte, `META-INF` included. Only old signature files
-are replaced, so an APK that is already signed simply gets re-signed. Every result is checked
-before you get it: the v2 signature must verify with the expected certificate, and the file must
-be zip-aligned.
+are replaced, so an APK that is already signed simply gets re-signed. (A separate copy also changes
+`AndroidManifest.xml` and `resources.arsc`, as described below.) Every result is checked before you
+get it: the v2 signature must verify with the expected certificate, and the file must be
+zip-aligned.
+
+## Separate copies
+
+Android tells apps apart by their package name, not by their signature. An APK signed with a
+different key still counts as the same app, so Android refuses to install it while the original is
+installed. To run two or more copies of one app on the same device, each copy needs its own package
+name.
+
+With **Separate copy** ticked, the signer also:
+
+- gives the app a new package name: `<package>.c<yyyyMMddHHmmss>`, for example
+  `com.example.app.c20261016114748`,
+- renames what Android requires to be unique per app: content provider authorities and the app's
+  own permissions that start with the old package name,
+- adds the time it was made to the app's name, for example `My App 11:47:48 16 Oct`, so the copies
+  can be told apart. The time comes first because launchers cut long names at the end,
+- records the new package name in `resources.arsc`.
+
+Class names are left alone, so the code runs unchanged. Each copy keeps its own data and starts out
+like a fresh install. The file is named `<name>-COPY-<yyyyMMdd>-<HHmmss>-SIGNED.apk`, matching the
+package name.
+
+An app that checks its own package name at run time, or relies on a service registered to its
+package name (Google sign-in, Firebase, push notifications, map keys), may not work fully as a
+copy.
 
 Both versions were tested against Google's `apksig` verifier on real-world APKs up to 122 MB,
 including apps with a minimum SDK of 21 (v1 and v2 both verified) and apps with uncompressed
@@ -52,6 +79,7 @@ harness that runs the same code:
 
 ```
 selftest sign    <in.apk> <out.apk>
+selftest copy    <in.apk> <out.apk> [yyyy-mm-ddThh:mm:ss]
 selftest verify  <signed.apk>
 selftest inspect <file>
 ```

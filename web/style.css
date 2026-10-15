@@ -103,6 +103,13 @@ body {
 .view .headline { margin-bottom: 4px; font-size: 26px; font-weight: 600; color: var(--green-ink); }
 .view .meta { margin-top: 4px; font-size: 14px; color: var(--muted); }
 .view .hint { margin-top: 12px; font-size: 13px; color: var(--faint); }
+.view .copy-note { margin-top: 12px; overflow-wrap: anywhere; }
+
+.option { display: flex; align-items: flex-start; gap: 10px; margin-top: 14px; cursor: pointer; }
+.option.disabled { cursor: default; opacity: 0.6; }
+.option input { flex: none; width: 18px; height: 18px; margin: 2px 0 0; accent-color: var(--green-button); cursor: inherit; }
+.option-title { display: block; font-size: 14px; font-weight: 600; }
+.option-hint { display: block; font-size: 13px; color: var(--muted); }
 
 .progress { width: min(320px, 100%); margin: 16px auto 0; }
 .track { height: 6px; overflow: hidden; border-radius: 3px; background: var(--track); }

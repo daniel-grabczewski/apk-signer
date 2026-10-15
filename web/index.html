@@ -38,9 +38,18 @@
         <p class="headline">Signed successfully</p>
         <p id="done-name" class="title"></p>
         <p id="done-meta" class="meta"></p>
+        <p id="done-copy" class="meta copy-note" hidden></p>
       </div>
     </div>
     <input id="picker" type="file" accept=".apk" hidden>
+
+    <label class="option">
+      <input id="copy" type="checkbox">
+      <span>
+        <span class="option-title">Separate copy</span>
+        <span class="option-hint">Installs alongside the original, named with the time it was made.</span>
+      </span>
+    </label>
 
     <footer class="actions">
       <p id="status" class="status" role="status"></p>

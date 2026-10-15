@@ -6,6 +6,7 @@ const picker = $('picker');
 const signButton = $('sign');
 const anotherButton = $('another');
 const againLink = $('again');
+const copyBox = $('copy');
 const statusLine = $('status');
 const views = { empty: $('view-empty'), ready: $('view-ready'), done: $('view-done') };
 
@@ -13,12 +14,19 @@ const IDLE = 'Nothing is uploaded. Your APK is signed right here in your browser
 
 let view = 'empty';  // what the box shows: empty, ready (an APK to sign) or done
 let apk = null;      // the File waiting to be signed
-let signed = null;   // { url, name, size } of the APK just signed
+let signed = null;   // { url, name, size, copy } of the APK just signed
 let busy = false;
 let shownPercent = -1;
 
 function formatSize(bytes) {
   return bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : `${Math.ceil(bytes / 1024)} KB`;
+}
+
+// 16 Oct 2026 11:47:48 -> "20261016-114748"
+function stamp(time) {
+  const pad2 = (n) => String(n).padStart(2, '0');
+  return `${time.getFullYear()}${pad2(time.getMonth() + 1)}${pad2(time.getDate())}`
+    + `-${pad2(time.getHours())}${pad2(time.getMinutes())}${pad2(time.getSeconds())}`;
 }
 
 function setStatus(text, isError = false) {
@@ -41,6 +49,8 @@ function render() {
   anotherButton.hidden = !done;
   againLink.hidden = !done;
   statusLine.hidden = done;
+  copyBox.disabled = busy;
+  copyBox.closest('.option').classList.toggle('disabled', busy);
   if (view === 'ready') {
     $('ready-name').textContent = apk.name;
     $('ready-meta').textContent = formatSize(apk.size);
@@ -48,6 +58,8 @@ function render() {
   if (done) {
     $('done-name').textContent = signed.name;
     $('done-meta').textContent = `${formatSize(signed.size)}  ·  Downloaded`;
+    $('done-copy').hidden = !signed.copy;
+    $('done-copy').textContent = signed.copy ? `Installs alongside the original as “${signed.copy.label}”` : '';
   }
 }
 
@@ -112,9 +124,12 @@ async function sign() {
   render();
   setStatus('Signing...');
   try {
-    const output = await signApk(await apk.arrayBuffer(), showProgress);
-    const blob = new Blob([output], { type: 'application/vnd.android.package-archive' });
-    signed = { url: URL.createObjectURL(blob), name: `${apk.name.replace(/\.apk$/i, '')}-SIGNED.apk`, size: blob.size };
+    const copyAt = copyBox.checked ? new Date() : null;
+    const result = await signApk(await apk.arrayBuffer(), showProgress, { copyAt });
+    const blob = new Blob([result.apk], { type: 'application/vnd.android.package-archive' });
+    const stem = apk.name.replace(/\.apk$/i, '');
+    const name = copyAt ? `${stem}-COPY-${stamp(copyAt)}-SIGNED.apk` : `${stem}-SIGNED.apk`;
+    signed = { url: URL.createObjectURL(blob), name, size: blob.size, copy: result.copy };
     apk = null;
     view = 'done';
     download();

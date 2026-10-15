@@ -10,3 +10,5 @@
 #define IDC_STATUS       202
 #define IDC_LINK         203
 #define IDC_ANOTHER      204
+#define IDC_COPY         205
+#define IDC_COPY_HINT    206

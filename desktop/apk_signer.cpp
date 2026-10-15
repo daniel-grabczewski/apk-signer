@@ -5,7 +5,9 @@
 // apksigner writes with v1 and v2 enabled: a JAR signature (META-INF/MANIFEST.MF, CERT.SF and
 // CERT.RSA, which Android 6 and older check) plus an APK Signature Scheme v2 block (Android 7 and
 // newer), zip-aligned. Everything else in the APK stays exactly as it was, META-INF included;
-// only old signature files are replaced. web/signer.js is the same signer for the browser.
+// only old signature files are replaced. The one exception is a separate copy (ticked in the
+// window), which also changes AndroidManifest.xml and resources.arsc so the APK installs alongside
+// the original. web/signer.js is the same signer for the browser.
 //
 // Nothing is saved until the result has been checked: its v2 signature must verify with the
 // expected certificate, it must be zip-aligned, and every entry must match what was written.
@@ -59,6 +61,14 @@ std::wstring Widen(const std::string& s, UINT codePage = CP_UTF8) {
     return w;
 }
 
+std::string Narrow(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
 std::wstring Trim(std::wstring s) {
     auto blank = [](wchar_t c) { return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'; };
     while (!s.empty() && blank(s.back())) s.pop_back();
@@ -88,12 +98,12 @@ std::wstring Folder(const std::wstring& path) {
     return path.substr(0, slash);
 }
 
-// "app.apk" -> "app-SIGNED.apk"
-std::wstring SignedName(const std::wstring& path) {
+// "app.apk" -> "app-SIGNED.apk", or "app<tag>-SIGNED.apk"
+std::wstring SignedName(const std::wstring& path, const std::wstring& tag = {}) {
     std::wstring name = FileName(path);
     const size_t dot = name.find_last_of(L'.');
     if (dot != std::wstring::npos && dot > 0) name.resize(dot);
-    return name + L"-SIGNED.apk";
+    return name + tag + L"-SIGNED.apk";
 }
 
 bool HasApkExtension(const std::wstring& path) {
@@ -387,8 +397,12 @@ struct ZipEntry {
     uint16_t internalAttributes = 0;
     uint32_t externalAttributes = 0;
     uint32_t localOffset = 0;
-    bool added = false;  // a signature file this signer wrote
-    ByteVec data;        // its compressed data
+    bool added = false;     // a signature file this signer wrote
+    bool replaced = false;  // a file a separate copy changes
+    ByteVec data;           // the compressed data of an added or replaced entry
+    ByteVec plain;          // a replaced entry's new content, uncompressed
+    uint16_t localVersionNeeded = 20;  // and the fields of its original local header
+    ByteVec localExtra;
 };
 
 bool FindZipLayout(const uint8_t* d, uint64_t size, ZipLayout& z) {
@@ -460,6 +474,37 @@ bool ReadLocal(const uint8_t* d, uint64_t limit, const ZipEntry& e, LocalParts& 
     return true;
 }
 
+// An entry's uncompressed content. `buffer` holds it when it had to be inflated.
+bool EntryContent(const uint8_t* d, uint64_t limit, const ZipEntry& e, ByteVec& buffer, Bytes& content,
+                  std::wstring& problem) {
+    if (e.replaced) {
+        content = e.plain;
+        return true;
+    }
+    LocalParts local;
+    if (!ReadLocal(d, limit, e, local)) {
+        problem = Widen(e.name) + L" in that APK is damaged.";
+        return false;
+    }
+    content = local.data;
+    if (e.method == 8) {
+        buffer.resize(e.size);
+        if (e.size && tinfl_decompress_mem_to_mem(buffer.data(), buffer.size(), local.data.p, local.data.n, 0) != e.size) {
+            problem = Widen(e.name) + L" in that APK cannot be decompressed.";
+            return false;
+        }
+        content = buffer;
+    } else if (e.method != 0) {
+        problem = Widen(e.name) + L" uses a compression method this signer does not support.";
+        return false;
+    }
+    if (content.n != e.size) {
+        problem = Widen(e.name) + L" in that APK is damaged.";
+        return false;
+    }
+    return true;
+}
+
 // The old signature's files, which a new signature replaces. The rest of META-INF stays.
 bool IsSignatureFile(const std::string& name) {
     if (name.rfind("META-INF/", 0) != 0 || name.find('/', 9) != std::string::npos) return false;
@@ -518,32 +563,13 @@ bool JarSignature(const MappedFile& input, const ZipLayout& zip, const std::vect
         return false;
     }
     uint8_t digest[32];
-    ByteVec plain;
+    ByteVec buffer;
     ByteVec manifest = Concat({Attribute("Manifest-Version", "1.0"), Attribute("Created-By", "1.0 (Android)"), kCrlf});
     std::vector<ByteVec> sections;
     sections.reserve(listed.size());
     for (const ZipEntry* e : listed) {
-        LocalParts local;
-        if (!ReadLocal(input.data(), zip.cdOffset, *e, local)) {
-            problem = Widen(e->name) + L" in that APK is damaged.";
-            return false;
-        }
-        Bytes content = local.data;
-        if (e->method == 8) {
-            plain.resize(e->size);
-            if (e->size && tinfl_decompress_mem_to_mem(plain.data(), plain.size(), local.data.p, local.data.n, 0) != e->size) {
-                problem = Widen(e->name) + L" in that APK cannot be decompressed.";
-                return false;
-            }
-            content = plain;
-        } else if (e->method != 0) {
-            problem = Widen(e->name) + L" uses a compression method this signer does not support.";
-            return false;
-        }
-        if (content.n != e->size) {
-            problem = Widen(e->name) + L" in that APK is damaged.";
-            return false;
-        }
+        Bytes content;
+        if (!EntryContent(input.data(), zip.cdOffset, *e, buffer, content, problem)) return false;
         sha.Update(content.p, content.n);
         sha.Finish(digest);
         sections.push_back(Concat({Attribute("Name", Text(e->name)), Attribute("SHA-256-Digest", Base64({digest, 32})), kCrlf}));
@@ -675,6 +701,8 @@ bool LayOut(const MappedFile& input, const ZipLayout& zip, const std::vector<Zip
         LocalParts local;
         if (e.added) {
             local.data = e.data;
+        } else if (e.replaced) {
+            local = {e.localVersionNeeded, e.localExtra, e.data};
         } else if (!ReadLocal(input.data(), zip.cdOffset, e, local)) {
             problem = Widen(e.name) + L" in that APK is damaged.";
             return false;
@@ -933,12 +961,464 @@ std::wstring InspectApk(const std::wstring& path, uint64_t& size) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Separate copies (the same as the section in web/signer.js)
+//
+// Android tells apps apart by package name, not by signature, so a copy needs its own package
+// name to install alongside the original. The manifest's package changes, along with what has to
+// be unique per app (provider authorities and the app's own permissions); class names stay put, so
+// the code runs unchanged. The label gets the time, so the copies can be told apart on the
+// launcher, and resources.arsc takes the new package name too, so lookups by name keep working.
+
+struct CopyInfo {
+    std::wstring packageName;  // both empty when the APK was signed as it is
+    std::wstring label;
+};
+
+const wchar_t* const kMonths[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun",
+                                  L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+
+// Whether b has n bytes from p on.
+bool Within(Bytes b, uint64_t p, uint64_t n) { return p <= b.n && n <= b.n - p; }
+
+// The string pool of a binary XML file or a resource table.
+struct StringPool {
+    uint64_t start = 0;
+    uint32_t headerSize = 0, size = 0, count = 0, styleCount = 0, flags = 0, stringsStart = 0, stylesStart = 0;
+    bool utf8() const { return (flags & 0x100) != 0; }
+};
+
+bool ReadPool(Bytes b, uint64_t start, StringPool& pool) {
+    if (!Within(b, start, 28) || Le16(b.p + start) != 0x0001) return false;
+    pool.start = start;
+    pool.headerSize = Le16(b.p + start + 2);
+    pool.size = Le32(b.p + start + 4);
+    pool.count = Le32(b.p + start + 8);
+    pool.styleCount = Le32(b.p + start + 12);
+    pool.flags = Le32(b.p + start + 16);
+    pool.stringsStart = Le32(b.p + start + 20);
+    pool.stylesStart = Le32(b.p + start + 24);
+    return pool.headerSize >= 28 && Within(b, start, pool.size) &&
+           pool.headerSize + (uint64_t{pool.count} + pool.styleCount) * 4 <= pool.size &&
+           pool.stringsStart <= pool.size && pool.stylesStart <= pool.size;
+}
+
+// String `index` of a pool. False if it does not lie inside the pool.
+bool PoolString(Bytes b, const StringPool& pool, uint32_t index, std::wstring& out) {
+    if (index >= pool.count) return false;
+    const uint64_t end = pool.start + pool.size;
+    uint64_t p = pool.start + pool.stringsStart + Le32(b.p + pool.start + pool.headerSize + uint64_t{index} * 4);
+    auto fits = [&](uint64_t n) { return p <= end && n <= end - p; };
+    if (pool.utf8()) {
+        if (!fits(2)) return false;
+        p += (b.p[p] & 0x80) ? 2 : 1;  // the length in UTF-16 units, not needed here
+        if (!fits(2)) return false;
+        uint64_t n = b.p[p];
+        if (n & 0x80) {
+            n = ((n & 0x7f) << 8) | b.p[p + 1];
+            p += 2;
+        } else {
+            p += 1;
+        }
+        if (!fits(n)) return false;
+        out = Widen(std::string(reinterpret_cast<const char*>(b.p + p), static_cast<size_t>(n)));
+    } else {
+        if (!fits(2)) return false;
+        uint64_t n = Le16(b.p + p);
+        p += 2;
+        if (n & 0x8000) {
+            if (!fits(2)) return false;
+            n = ((n & 0x7fff) << 16) | Le16(b.p + p);
+            p += 2;
+        }
+        if (!fits(n * 2)) return false;
+        out.resize(static_cast<size_t>(n));
+        if (n) std::memcpy(out.data(), b.p + p, static_cast<size_t>(n) * 2);
+    }
+    return true;
+}
+
+// One string as a pool stores it. Callers keep it under 0x8000 units and bytes.
+ByteVec PoolEntry(const std::wstring& s, bool utf8) {
+    ByteVec out;
+    if (utf8) {
+        const std::string bytes = Narrow(s);
+        auto length = [&out](size_t n) {
+            if (n > 0x7f) out.push_back(static_cast<uint8_t>(0x80 | (n >> 8)));
+            out.push_back(static_cast<uint8_t>(n));
+        };
+        length(s.size());
+        length(bytes.size());
+        out.insert(out.end(), bytes.begin(), bytes.end());
+        out.push_back(0);
+    } else {
+        out.assign(2 + s.size() * 2 + 2, 0);
+        Put16(out.data(), static_cast<uint32_t>(s.size()));
+        if (!s.empty()) std::memcpy(out.data() + 2, s.data(), s.size() * 2);
+    }
+    return out;
+}
+
+// The string pool with `added` appended. Existing indexes stay as they are.
+ByteVec AppendToPool(Bytes b, const StringPool& pool, const std::vector<std::wstring>& added) {
+    const uint64_t s = pool.start;
+    const uint64_t offsetsEnd = s + pool.headerSize + uint64_t{pool.count} * 4;
+    const Bytes styleOffsets(b.p + offsetsEnd, size_t{pool.styleCount} * 4);
+    const uint64_t dataEnd = std::max<uint64_t>(pool.stylesStart ? pool.stylesStart : pool.size, pool.stringsStart);
+    ByteVec offsets(b.p + s + pool.headerSize, b.p + offsetsEnd);
+    ByteVec strings(b.p + s + pool.stringsStart, b.p + s + dataEnd);
+    for (const std::wstring& text : added) {
+        const ByteVec entry = PoolEntry(text, pool.utf8());
+        offsets.resize(offsets.size() + 4);
+        Put32(offsets.data() + offsets.size() - 4, static_cast<uint32_t>(strings.size()));
+        strings.insert(strings.end(), entry.begin(), entry.end());
+    }
+    strings.resize((strings.size() + 3) & ~size_t{3});
+    const Bytes styles = pool.styleCount ? Bytes(b.p + s + pool.stylesStart, pool.size - pool.stylesStart) : Bytes();
+    ByteVec header(b.p + s, b.p + s + pool.headerSize);
+    const uint32_t stringsStart = static_cast<uint32_t>(pool.headerSize + offsets.size() + styleOffsets.n);
+    Put32(header.data() + 4, static_cast<uint32_t>(stringsStart + strings.size() + styles.n));
+    Put32(header.data() + 8, static_cast<uint32_t>(pool.count + added.size()));
+    Put32(header.data() + 16, pool.flags & ~1u);  // appended strings are not in sorted order
+    Put32(header.data() + 20, stringsStart);
+    Put32(header.data() + 24, pool.styleCount ? static_cast<uint32_t>(stringsStart + strings.size()) : 0);
+    return Concat({header, offsets, styleOffsets, strings, styles});
+}
+
+struct XmlAttribute {
+    uint64_t at = 0;  // where its 20 bytes start
+    std::wstring name;
+    uint8_t type = 0;
+    uint32_t data = 0;
+    const std::wstring* value = nullptr;  // for a string
+};
+
+struct XmlElement {
+    std::wstring name;
+    std::vector<XmlAttribute> attributes;
+};
+
+bool ReadElement(Bytes axml, uint64_t p, uint32_t size, const std::vector<std::wstring>& strings, XmlElement& element) {
+    if (size < 36) return false;
+    const uint32_t name = Le32(axml.p + p + 20);
+    if (name < strings.size()) element.name = strings[name];
+    const uint16_t start = Le16(axml.p + p + 24), stride = Le16(axml.p + p + 26), count = Le16(axml.p + p + 28);
+    for (uint32_t k = 0; k < count; ++k) {
+        XmlAttribute a;
+        a.at = p + 16 + start + uint64_t{k} * stride;
+        if (stride < 20 || a.at + 20 > p + size) return false;
+        const uint32_t attributeName = Le32(axml.p + a.at + 4);
+        if (attributeName < strings.size()) a.name = strings[attributeName];
+        a.type = axml.p[a.at + 15];
+        a.data = Le32(axml.p + a.at + 16);
+        if (a.type == 0x03) {
+            if (a.data >= strings.size()) return false;
+            a.value = &strings[a.data];
+        }
+        element.attributes.push_back(std::move(a));
+    }
+    return true;
+}
+
+// For entry `index` of the type chunk at q: 1 and its string value, 0 when it is there but not a
+// plain string, -1 when this chunk is not the default configuration or does not have it.
+int DefaultEntryString(Bytes arsc, uint64_t q, uint32_t size, uint32_t index, const StringPool* values, std::wstring& out) {
+    const uint16_t headerSize = Le16(arsc.p + q + 2);
+    const uint8_t flags = arsc.p[q + 9];
+    const uint32_t count = Le32(arsc.p + q + 12);
+    const uint32_t entriesStart = Le32(arsc.p + q + 16);
+    const uint32_t configSize = Le32(arsc.p + q + 20);
+    if (20 + uint64_t{configSize} > headerSize || headerSize > size) return -1;
+    for (uint32_t i = 4; i < configSize; ++i)
+        if (arsc.p[q + 20 + i]) return -1;
+    const uint64_t end = q + size;
+    uint64_t offset = UINT64_MAX;
+    if (flags & 0x01) {  // sparse: (index, offset / 4) pairs
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint64_t at = q + headerSize + uint64_t{i} * 4;
+            if (at + 4 > end) return 0;
+            if (Le16(arsc.p + at) == index) offset = uint64_t{Le16(arsc.p + at + 2)} * 4;
+        }
+    } else if (flags & 0x02) {  // 16-bit offsets, in units of 4
+        const uint64_t at = q + headerSize + uint64_t{index} * 2;
+        if (index < count && at + 2 <= end && Le16(arsc.p + at) != 0xffff) offset = uint64_t{Le16(arsc.p + at)} * 4;
+    } else {
+        const uint64_t at = q + headerSize + uint64_t{index} * 4;
+        if (index < count && at + 4 <= end && Le32(arsc.p + at) != 0xffffffff) offset = Le32(arsc.p + at);
+    }
+    if (offset == UINT64_MAX) return -1;
+    const uint64_t entry = q + entriesStart + offset;
+    if (entry + 8 > end) return 0;
+    const uint16_t entryFlags = Le16(arsc.p + entry + 2);
+    uint8_t type = 0;
+    uint32_t data = 0;
+    if (entryFlags & 0x0008) {  // compact: the value's type is in the flags' high byte, its data inline
+        type = static_cast<uint8_t>(entryFlags >> 8);
+        data = Le32(arsc.p + entry + 4);
+    } else if (entryFlags & 0x0001) {
+        return 0;  // a map (style, array)
+    } else {
+        const uint64_t value = entry + Le16(arsc.p + entry);
+        if (value + 8 > end) return 0;
+        type = arsc.p[value + 3];
+        data = Le32(arsc.p + value + 4);
+    }
+    return type == 0x03 && values && PoolString(arsc, *values, data, out) ? 1 : 0;
+}
+
+// The string value of resource `id` in its default configuration.
+bool ResolveString(Bytes arsc, uint32_t id, std::wstring& out) {
+    if (!Within(arsc, 0, 12) || Le16(arsc.p) != 0x0002) return false;
+    StringPool values;
+    bool haveValues = false;
+    for (uint64_t p = Le16(arsc.p + 2); Within(arsc, p, 8);) {
+        const uint32_t size = Le32(arsc.p + p + 4);
+        if (size < 8 || !Within(arsc, p, size)) return false;
+        if (Le16(arsc.p + p) == 0x0001 && !haveValues) haveValues = ReadPool(arsc, p, values);
+        if (Le16(arsc.p + p) == 0x0200 && size >= 12 && Le32(arsc.p + p + 8) == id >> 24) {
+            for (uint64_t q = p + Le16(arsc.p + p + 2); q + 8 <= p + size;) {
+                const uint32_t chunkSize = Le32(arsc.p + q + 4);
+                if (chunkSize < 8 || q + chunkSize > p + size) return false;
+                if (Le16(arsc.p + q) == 0x0201 && chunkSize >= 24 && arsc.p[q + 8] == ((id >> 16) & 0xff)) {
+                    const int found = DefaultEntryString(arsc, q, chunkSize, id & 0xffff, haveValues ? &values : nullptr, out);
+                    if (found >= 0) return found == 1;
+                }
+                q += chunkSize;
+            }
+        }
+        p += size;
+    }
+    return false;
+}
+
+bool IsPermissionElement(const std::wstring& name) {
+    return name == L"permission" || name == L"permission-group" || name == L"permission-tree" ||
+           name == L"uses-permission" || name == L"uses-permission-sdk-23";
+}
+
+bool IsPermissionAttribute(const std::wstring& name) {
+    return name == L"permission" || name == L"readPermission" || name == L"writePermission" || name == L"taskAffinity";
+}
+
+struct Rewrite {
+    ByteVec manifest;
+    std::wstring from, to, label;  // the old and new package names, and the app's new label
+};
+
+// Rewrites the binary AndroidManifest.xml for a copy: the package becomes "<package>.c<stamp>" and
+// the app's label gets `shown` added.
+bool RewriteManifest(Bytes axml, Bytes arsc, const std::wstring& stamp, const std::wstring& shown, Rewrite& out,
+                     std::wstring& problem) {
+    problem = L"Its AndroidManifest.xml is not in the expected binary format.";
+    if (!Within(axml, 0, 8) || Le16(axml.p) != 0x0003) return false;
+    const uint64_t poolStart = Le16(axml.p + 2);
+    StringPool pool;
+    if (!ReadPool(axml, poolStart, pool)) return false;
+    std::vector<std::wstring> strings(pool.count);
+    for (uint32_t i = 0; i < pool.count; ++i)
+        if (!PoolString(axml, pool, i, strings[i])) return false;
+
+    // Every start tag in order, noting the activities that appear on the launcher.
+    std::vector<XmlElement> elements;
+    std::vector<size_t> open;
+    std::unordered_set<size_t> launchers;
+    for (uint64_t p = poolStart + pool.size; Within(axml, p, 8);) {
+        const uint32_t size = Le32(axml.p + p + 4);
+        if (size < 8 || !Within(axml, p, size)) return false;
+        if (Le16(axml.p + p) == 0x0102) {
+            XmlElement element;
+            if (!ReadElement(axml, p, size, strings, element)) return false;
+            open.push_back(elements.size());
+            if (element.name == L"category" && open.size() >= 3)
+                for (const XmlAttribute& a : element.attributes)
+                    if (a.name == L"name" && a.value && *a.value == L"android.intent.category.LAUNCHER")
+                        launchers.insert(open[open.size() - 3]);  // category, inside intent-filter, inside the activity
+            elements.push_back(std::move(element));
+        } else if (Le16(axml.p + p) == 0x0103 && !open.empty()) {
+            open.pop_back();
+        }
+        p += size;
+    }
+
+    size_t manifest = 0;
+    while (manifest < elements.size() && elements[manifest].name != L"manifest") ++manifest;
+    if (manifest == elements.size()) return false;
+    for (const XmlAttribute& a : elements[manifest].attributes)
+        if (a.name == L"package" && a.value) out.from = *a.value;
+    if (out.from.empty()) return false;
+    out.to = out.from + L".c" + stamp;
+    if (out.to.size() > 127) {
+        problem = L"That package name is too long to make a copy of.";
+        return false;
+    }
+    const std::wstring& from = out.from;
+    auto rename = [&](const std::wstring& v) {
+        if (v == from) return out.to;
+        if (v.size() > from.size() && v.compare(0, from.size(), from) == 0 && v[from.size()] == L'.')
+            return out.to + v.substr(from.size());
+        return v;
+    };
+
+    ByteVec result(axml.p, axml.p + axml.n);
+    std::vector<std::wstring> added;
+    auto set = [&](const XmlAttribute& a, const std::wstring& text) {
+        size_t index = static_cast<size_t>(std::find(strings.begin(), strings.end(), text) - strings.begin());
+        if (index == strings.size()) {
+            const size_t at = static_cast<size_t>(std::find(added.begin(), added.end(), text) - added.begin());
+            if (at == added.size()) added.push_back(text);
+            index = strings.size() + at;
+        }
+        uint8_t* p = result.data() + a.at;
+        Put32(p + 8, static_cast<uint32_t>(index));  // raw value
+        Put16(p + 12, 8);                             // typed value: a string
+        p[14] = 0;
+        p[15] = 0x03;
+        Put32(p + 16, static_cast<uint32_t>(index));
+    };
+
+    for (size_t i = 0; i < elements.size(); ++i) {
+        const XmlElement& element = elements[i];
+        for (const XmlAttribute& a : element.attributes) {
+            if (i == manifest && a.name == L"package") {
+                set(a, out.to);
+            } else if (a.name == L"label" && (element.name == L"application" || launchers.count(i))) {
+                std::wstring text;
+                if (a.value)
+                    text = *a.value;
+                else if (a.type != 0x01 || !ResolveString(arsc, a.data, text))
+                    text = from;
+                const std::wstring next = text + L" " + shown;
+                set(a, next);
+                if (element.name == L"application" || out.label.empty()) out.label = next;
+            } else if (a.value) {
+                std::wstring renamed = *a.value;
+                if (a.name == L"authorities") {
+                    renamed.clear();
+                    for (size_t begin = 0;;) {
+                        const size_t semicolon = a.value->find(L';', begin);
+                        renamed += rename(a.value->substr(begin, semicolon - begin));
+                        if (semicolon == std::wstring::npos) break;
+                        renamed += L';';
+                        begin = semicolon + 1;
+                    }
+                } else if ((a.name == L"name" && IsPermissionElement(element.name)) || IsPermissionAttribute(a.name)) {
+                    renamed = rename(*a.value);
+                }
+                if (renamed != *a.value) set(a, renamed);
+            }
+        }
+    }
+
+    for (const std::wstring& text : added) {
+        if (text.size() > 0x7fff || Narrow(text).size() > 0x7fff) {
+            problem = L"That APK has text too long to make a copy of.";
+            return false;
+        }
+    }
+    const Bytes rest(result.data() + poolStart + pool.size, static_cast<size_t>(result.size() - poolStart - pool.size));
+    out.manifest = Concat({Bytes(result.data(), static_cast<size_t>(poolStart)), AppendToPool(result, pool, added), rest});
+    Put32(out.manifest.data() + 4, static_cast<uint32_t>(out.manifest.size()));
+    problem.clear();
+    return true;
+}
+
+// resources.arsc names its package; the name sits in a fixed 128-character field.
+void RenameResourcePackage(ByteVec& arsc, const std::wstring& from, const std::wstring& to) {
+    if (arsc.size() < 12 || Le16(arsc.data()) != 0x0002) return;
+    for (uint64_t p = Le16(arsc.data() + 2); p + 8 <= arsc.size();) {
+        const uint32_t size = Le32(arsc.data() + p + 4);
+        if (size < 8 || p + size > arsc.size()) break;
+        if (Le16(arsc.data() + p) == 0x0200 && size >= 12 + 256) {
+            wchar_t name[129] = {};
+            std::memcpy(name, arsc.data() + p + 12, 256);
+            if (from == name) {
+                std::memset(arsc.data() + p + 12, 0, 256);
+                std::memcpy(arsc.data() + p + 12, to.data(), to.size() * 2);
+            }
+        }
+        p += size;
+    }
+}
+
+// Gives an entry new content, compressed the way it was.
+bool ReplaceContent(const MappedFile& input, const ZipLayout& zip, ZipEntry& e, ByteVec plain) {
+    LocalParts local;
+    if (!ReadLocal(input.data(), zip.cdOffset, e, local)) return false;
+    e.localVersionNeeded = local.versionNeeded;
+    e.localExtra.assign(local.extra.p, local.extra.p + local.extra.n);
+    if (e.method == 8) {
+        size_t length = 0;
+        void* compressed = tdefl_compress_mem_to_heap(plain.data(), plain.size(), &length,
+                                                      static_cast<int>(tdefl_create_comp_flags_from_zip_params(9, -15, 0)));
+        if (!compressed) return false;
+        e.data.assign(static_cast<const uint8_t*>(compressed), static_cast<const uint8_t*>(compressed) + length);
+        mz_free(compressed);
+    } else {
+        e.data = plain;
+    }
+    e.crc = static_cast<uint32_t>(mz_crc32(MZ_CRC32_INIT, plain.data(), plain.size()));
+    e.size = static_cast<uint32_t>(plain.size());
+    e.compressedSize = static_cast<uint32_t>(e.data.size());
+    e.plain = std::move(plain);
+    e.replaced = true;
+    return true;
+}
+
+// "20261016114748": when a copy was made, as its package name and file name carry it.
+std::wstring CopyStamp(const SYSTEMTIME& when, bool forFileName) {
+    wchar_t text[32];
+    swprintf_s(text, forFileName ? L"%04u%02u%02u-%02u%02u%02u" : L"%04u%02u%02u%02u%02u%02u", unsigned{when.wYear},
+               unsigned{when.wMonth}, unsigned{when.wDay}, unsigned{when.wHour}, unsigned{when.wMinute}, unsigned{when.wSecond});
+    return text;
+}
+
+bool MakeSeparateCopy(const MappedFile& input, const ZipLayout& zip, std::vector<ZipEntry>& entries,
+                      const SYSTEMTIME& when, CopyInfo& copy, std::wstring& problem) {
+    ZipEntry* manifest = nullptr;
+    ZipEntry* table = nullptr;
+    for (ZipEntry& e : entries) {
+        if (e.name == "AndroidManifest.xml") manifest = &e;
+        if (e.name == "resources.arsc") table = &e;
+    }
+    if (!manifest || when.wMonth < 1 || when.wMonth > 12) {
+        problem = L"Could not make a copy of that APK.";
+        return false;
+    }
+    ByteVec manifestBuffer, tableBuffer;
+    Bytes manifestContent, tableContent;
+    if (!EntryContent(input.data(), zip.cdOffset, *manifest, manifestBuffer, manifestContent, problem) ||
+        (table && !EntryContent(input.data(), zip.cdOffset, *table, tableBuffer, tableContent, problem)))
+        return false;
+
+    // The time goes before the date: launchers cut long labels at the end, and the time is what
+    // tells copies made on the same day apart.
+    wchar_t shown[48];
+    swprintf_s(shown, L"%02u:%02u:%02u %u %ls", unsigned{when.wHour}, unsigned{when.wMinute}, unsigned{when.wSecond},
+               unsigned{when.wDay}, kMonths[when.wMonth - 1]);
+    Rewrite rewrite;
+    if (!RewriteManifest(manifestContent, tableContent, CopyStamp(when, false), shown, rewrite, problem)) return false;
+    ByteVec renamedTable;
+    if (table) {
+        renamedTable.assign(tableContent.p, tableContent.p + tableContent.n);
+        RenameResourcePackage(renamedTable, rewrite.from, rewrite.to);
+    }
+    if (!ReplaceContent(input, zip, *manifest, std::move(rewrite.manifest)) ||
+        (table && !ReplaceContent(input, zip, *table, std::move(renamedTable)))) {
+        problem = L"Could not compress the changed files.";
+        return false;
+    }
+    copy.packageName = rewrite.to;
+    copy.label = rewrite.label;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Signing, on a worker thread
 
 struct Outcome {
     bool ok = false;
     std::wstring output;   // where the signed APK was saved
     uint64_t size = 0;     // and how big it is
+    CopyInfo copy;         // what a separate copy installs as
     std::wstring problem;  // one line, for the status bar
     std::wstring details;  // more for the error box, such as the Windows error
 };
@@ -978,7 +1458,8 @@ bool WriteAll(const std::wstring& path, std::initializer_list<Bytes> parts) {
     return ok;
 }
 
-Outcome SignApk(const std::wstring& inputPath, const std::wstring& outputPath) {
+// With copyAt, the APK is also turned into a separate copy made at that time.
+Outcome SignApk(const std::wstring& inputPath, const std::wstring& outputPath, const SYSTEMTIME* copyAt = nullptr) {
     MappedFile input;
     if (!input.Open(inputPath)) return Failed(L"Could not read the APK.", ErrorText(GetLastError()));
     ZipLayout zip;
@@ -998,6 +1479,8 @@ Outcome SignApk(const std::wstring& inputPath, const std::wstring& outputPath) {
         if (!IsSignatureFile(e.name)) kept.push_back(std::move(e));
 
     std::wstring problem;
+    CopyInfo copy;
+    if (copyAt && !MakeSeparateCopy(input, zip, kept, *copyAt, copy, problem)) return Failed(problem);
     std::vector<JarFile> jarFiles;
     if (!JarSignature(input, zip, kept, key, cert, fields, jarFiles, problem)) return Failed(problem);
     for (const JarFile& file : jarFiles) {
@@ -1040,6 +1523,7 @@ Outcome SignApk(const std::wstring& inputPath, const std::wstring& outputPath) {
     outcome.ok = true;
     outcome.output = outputPath;
     outcome.size = body.size() + block.size() + central.size() + end.size();
+    outcome.copy = std::move(copy);
     return outcome;
 }
 
@@ -1047,11 +1531,13 @@ struct Job {
     HWND dialog;
     std::wstring input;
     std::wstring output;
+    bool copy;
+    SYSTEMTIME copyAt;
 };
 
 DWORD WINAPI SignThread(void* param) {
     Job* job = static_cast<Job*>(param);
-    auto* outcome = new Outcome(SignApk(job->input, job->output));
+    auto* outcome = new Outcome(SignApk(job->input, job->output, job->copy ? &job->copyAt : nullptr));
     if (!PostMessageW(job->dialog, WM_APP_DONE, 0, reinterpret_cast<LPARAM>(outcome))) delete outcome;
     delete job;
     return 0;
@@ -1073,6 +1559,7 @@ struct State {
     uint64_t apkSize = 0;
     std::wstring saved;    // the signed APK last written
     uint64_t savedSize = 0;
+    std::wstring savedLabel;  // what it installs as, when it is a separate copy
     std::wstring pending;  // an APK given on the command line (or dropped on the exe's icon)
     bool busy = false;
     Tone tone = Tone::Normal;
@@ -1098,6 +1585,7 @@ void Focus(int id) { SendMessageW(g.dialog, WM_NEXTDLGCTL, reinterpret_cast<WPAR
 void UpdateControls() {
     const bool done = g.view == View::Signed;
     EnableWindow(Item(IDC_DROP), !g.busy && !done);
+    EnableWindow(Item(IDC_COPY), !g.busy);
     EnableWindow(Item(IDOK), !g.busy && g.view == View::Ready);
     ShowWindow(Item(IDOK), done ? SW_HIDE : SW_SHOW);
     ShowWindow(Item(IDC_ANOTHER), done ? SW_SHOW : SW_HIDE);
@@ -1114,7 +1602,7 @@ void UpdateControls() {
         text = FileName(g.apk) + L", " + FormatSize(g.apkSize) + L", in " + Folder(g.apk);
     else
         text = L"Signed successfully: " + FileName(g.saved) + L", " + FormatSize(g.savedSize) + L", saved in " +
-               Folder(g.saved);
+               Folder(g.saved) + (g.savedLabel.empty() ? L"" : L". Installs alongside the original as " + g.savedLabel);
     SetWindowTextW(Item(IDC_DROP), text.c_str());
     InvalidateRect(Item(IDC_DROP), nullptr, TRUE);
 }
@@ -1188,8 +1676,8 @@ void Browse() {
     if (!path.empty()) SelectApk(path);
 }
 
-// The save dialog opens in the APK's own folder, suggesting "<name>-SIGNED.apk".
-std::wstring AskWhereToSave() {
+// The save dialog opens in the APK's own folder, suggesting `name`.
+std::wstring AskWhereToSave(const std::wstring& name) {
     IFileSaveDialog* dialog = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return {};
     dialog->SetFileTypes(1, kApkType);
@@ -1199,7 +1687,7 @@ std::wstring AskWhereToSave() {
     dialog->GetOptions(&options);
     dialog->SetOptions(options | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOREADONLYRETURN);
     SetDialogFolder(dialog, Folder(g.apk));
-    dialog->SetFileName(SignedName(g.apk).c_str());
+    dialog->SetFileName(name.c_str());
     std::wstring path;
     if (SUCCEEDED(dialog->Show(g.dialog))) path = ResultPath(dialog);
     dialog->Release();
@@ -1208,9 +1696,13 @@ std::wstring AskWhereToSave() {
 
 void StartSigning() {
     if (g.busy || g.view != View::Ready) return;
-    const std::wstring output = AskWhereToSave();
+    // A copy is named after the moment Sign was pressed, in its file name and on the device.
+    const bool copy = IsDlgButtonChecked(g.dialog, IDC_COPY) == BST_CHECKED;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    const std::wstring output = AskWhereToSave(SignedName(g.apk, copy ? L"-COPY-" + CopyStamp(now, true) : L""));
     if (output.empty()) return;
-    auto* job = new Job{g.dialog, g.apk, output};
+    auto* job = new Job{g.dialog, g.apk, output, copy, now};
     HANDLE thread = CreateThread(nullptr, 0, SignThread, job, 0, nullptr);
     if (!thread) {
         delete job;
@@ -1228,6 +1720,7 @@ void OnSigned(Outcome* outcome) {
         // From here on only the signed APK matters, so the original is let go.
         g.saved = outcome->output;
         g.savedSize = outcome->size;
+        g.savedLabel = outcome->copy.label;
         g.apk.clear();
         ShowView(View::Signed);
     } else {
@@ -1286,6 +1779,29 @@ void Frame(HDC dc, const RECT& r, int width, int dash, int gap, COLORREF color) 
     DeleteObject(brush);
 }
 
+// A file name as one line, or as two when it is too wide: broken after the last "-" or "." that
+// lets the first line fit, the way a browser wraps it. DT_PATH_ELLIPSIS cannot shorten a name with
+// no backslash in it, so without this a long name would just be cut off at both ends.
+std::vector<std::wstring> WrapName(HDC dc, HFONT font, const std::wstring& text, int width) {
+    HGDIOBJ old = SelectObject(dc, font);
+    auto fits = [&](const std::wstring& s) {
+        SIZE size{};
+        GetTextExtentPoint32W(dc, s.c_str(), static_cast<int>(s.size()), &size);
+        return size.cx <= width;
+    };
+    std::vector<std::wstring> lines{text};
+    if (!fits(text)) {
+        for (size_t at = text.size() - 1; at > 0; --at) {
+            if ((text[at - 1] == L'-' || text[at - 1] == L'.') && fits(text.substr(0, at))) {
+                lines = {text.substr(0, at), text.substr(at)};
+                break;
+            }
+        }
+    }
+    SelectObject(dc, old);
+    return lines;
+}
+
 HFONT SemiboldFont(HFONT base, int numerator, int denominator) {
     LOGFONTW look{};
     GetObjectW(base, sizeof(look), &look);
@@ -1329,18 +1845,29 @@ void DrawDropZone(const DRAWITEMSTRUCT& item) {
         int height = 0;
     };
     const COLORREF ink = GetSysColor(COLOR_WINDOWTEXT), grey = RGB(96, 96, 96), light = RGB(130, 130, 130);
+    const int textWidth = rc.right - rc.left - 2 * px(14);
     std::vector<Line> lines;
+    // The file name in the large font, on two lines if it needs them.
+    auto addName = [&](const std::wstring& file, int gapBefore) {
+        for (const std::wstring& part : WrapName(dc, name, file, textWidth)) {
+            lines.push_back({part, name, ink, DT_END_ELLIPSIS, gapBefore});
+            gapBefore = 0;
+        }
+    };
     if (g.view == View::Empty) {
         lines = {{L"Drop an APK here", name, ink, 0, 0},
                  {L"or click to browse", body, grey, 0, px(2)}};
     } else if (g.view == View::Ready) {
-        lines = {{FileName(g.apk), name, ink, DT_PATH_ELLIPSIS, 0},
-                 {FormatSize(g.apkSize) + L"  ·  " + Folder(g.apk), body, grey, DT_PATH_ELLIPSIS, px(2)},
-                 {g.busy ? L"Signing..." : L"Drop another APK or click to change", body, light, 0, px(8)}};
+        addName(FileName(g.apk), 0);
+        lines.push_back({FormatSize(g.apkSize) + L"  ·  " + Folder(g.apk), body, grey, DT_PATH_ELLIPSIS, px(2)});
+        lines.push_back({g.busy ? L"Signing..." : L"Drop another APK or click to change", body, light, 0, px(8)});
     } else {
-        lines = {{L"Signed successfully", headline, kSuccessText, 0, 0},
-                 {FileName(g.saved), name, ink, DT_PATH_ELLIPSIS, px(4)},
-                 {FormatSize(g.savedSize) + L"  ·  " + Folder(g.saved), body, grey, DT_PATH_ELLIPSIS, px(14)}};
+        lines = {{L"Signed successfully", headline, kSuccessText, 0, 0}};
+        addName(FileName(g.saved), px(4));
+        lines.push_back({FormatSize(g.savedSize) + L"  ·  " + Folder(g.saved), body, grey, DT_PATH_ELLIPSIS, px(14)});
+        if (!g.savedLabel.empty())
+            lines.push_back({L"Installs alongside the original as “" + g.savedLabel + L"”", body, grey,
+                             DT_END_ELLIPSIS, px(6)});
     }
 
     SetBkMode(dc, TRANSPARENT);
@@ -1442,6 +1969,12 @@ INT_PTR CALLBACK DialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
             HDC dc = reinterpret_cast<HDC>(wParam);
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, g.tone == Tone::Bad ? RGB(196, 43, 28) : GetSysColor(COLOR_WINDOWTEXT));
+            return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));
+        }
+        if (reinterpret_cast<HWND>(lParam) == Item(IDC_COPY_HINT)) {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(96, 96, 96));
             return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));
         }
         break;
