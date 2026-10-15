@@ -1,4 +1,4 @@
-import { ApkError, inspectApk, signApk } from './signer.js';
+import { ApkError, copyNameSlug, inspectApk, normalizeCopyName, signApk } from './signer.js';
 
 const $ = (id) => document.getElementById(id);
 const box = $('box');
@@ -7,6 +7,8 @@ const signButton = $('sign');
 const anotherButton = $('another');
 const againLink = $('again');
 const copyBox = $('copy');
+const nameRow = $('copy-name-row');
+const nameInput = $('copy-name');
 const statusLine = $('status');
 const views = { empty: $('view-empty'), ready: $('view-ready'), done: $('view-done') };
 
@@ -27,6 +29,33 @@ function stamp(time) {
   const pad2 = (n) => String(n).padStart(2, '0');
   return `${time.getFullYear()}${pad2(time.getMonth() + 1)}${pad2(time.getDate())}`
     + `-${pad2(time.getHours())}${pad2(time.getMinutes())}${pad2(time.getSeconds())}`;
+}
+
+// Copy names used before, newest first, offered as suggestions. Kept in this browser only.
+const NAMES_KEY = 'apk-signer.copy-names';
+
+function savedNames() {
+  try {
+    const names = JSON.parse(localStorage.getItem(NAMES_KEY) ?? '[]');
+    return Array.isArray(names) ? names.filter((name) => typeof name === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function showNames(names) {
+  $('copy-names').replaceChildren(...names.map((name) => Object.assign(document.createElement('option'), { value: name })));
+}
+
+// Names that make the same package are the same copy, so only the latest spelling is kept.
+function rememberName(name) {
+  const names = [name, ...savedNames().filter((other) => copyNameSlug(other) !== copyNameSlug(name))].slice(0, 10);
+  try {
+    localStorage.setItem(NAMES_KEY, JSON.stringify(names));
+  } catch {
+    // not saved: suggestions are only a convenience
+  }
+  showNames(names);
 }
 
 function setStatus(text, isError = false) {
@@ -51,6 +80,8 @@ function render() {
   statusLine.hidden = done;
   copyBox.disabled = busy;
   copyBox.closest('.option').classList.toggle('disabled', busy);
+  nameRow.hidden = !copyBox.checked;
+  nameInput.disabled = busy;
   if (view === 'ready') {
     $('ready-name').textContent = apk.name;
     $('ready-meta').textContent = formatSize(apk.size);
@@ -58,8 +89,11 @@ function render() {
   if (done) {
     $('done-name').textContent = signed.name;
     $('done-meta').textContent = `${formatSize(signed.size)}  ·  Downloaded`;
-    $('done-copy').hidden = !signed.copy;
-    $('done-copy').textContent = signed.copy ? `Installs alongside the original as “${signed.copy.label}”` : '';
+    const { copy } = signed;
+    $('done-copy').hidden = !copy;
+    $('done-copy').textContent = !copy ? ''
+      : copy.name ? `Installs as “${copy.label}”, updating any earlier “${copy.name}” copy`
+        : `Installs alongside the original as “${copy.label}”`;
   }
 }
 
@@ -125,11 +159,13 @@ async function sign() {
   setStatus('Signing...');
   try {
     const copyAt = copyBox.checked ? new Date() : null;
-    const result = await signApk(await apk.arrayBuffer(), showProgress, { copyAt });
+    const copyName = copyAt ? normalizeCopyName(nameInput.value) : '';
+    const result = await signApk(await apk.arrayBuffer(), showProgress, { copyAt, copyName });
     const blob = new Blob([result.apk], { type: 'application/vnd.android.package-archive' });
     const stem = apk.name.replace(/\.apk$/i, '');
-    const name = copyAt ? `${stem}-COPY-${stamp(copyAt)}-SIGNED.apk` : `${stem}-SIGNED.apk`;
-    signed = { url: URL.createObjectURL(blob), name, size: blob.size, copy: result.copy };
+    const tag = copyAt ? `-COPY-${copyName ? `${copyNameSlug(copyName)}-` : ''}${stamp(copyAt)}` : '';
+    signed = { url: URL.createObjectURL(blob), name: `${stem}${tag}-SIGNED.apk`, size: blob.size, copy: result.copy };
+    if (copyName) rememberName(copyName);
     apk = null;
     view = 'done';
     download();
@@ -167,6 +203,15 @@ picker.addEventListener('change', () => {
 });
 signButton.addEventListener('click', sign);
 anotherButton.addEventListener('click', signAnother);
+copyBox.addEventListener('change', () => {
+  render();
+  if (copyBox.checked) nameInput.focus();
+});
+nameInput.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter') return;
+  event.preventDefault();
+  sign();
+});
 againLink.addEventListener('click', (event) => {
   event.preventDefault();
   if (signed) download();
@@ -211,6 +256,7 @@ function supported() {
   }
 }
 
+showNames(savedNames());
 render();
 if (supported()) {
   setStatus(IDLE);

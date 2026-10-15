@@ -17,7 +17,7 @@ if not exist build mkdir build
 rem Only the raw deflate and inflate parts of miniz are used.
 set MINIZ=/DMINIZ_NO_STDIO /DMINIZ_NO_TIME /DMINIZ_NO_ARCHIVE_APIS /DMINIZ_NO_ZLIB_COMPATIBLE_NAMES
 set COMMON=/nologo /utf-8 /O1 /MT /DUNICODE /D_UNICODE %MINIZ% /Fobuild\
-set LIBS=user32.lib gdi32.lib shell32.lib ole32.lib uuid.lib comctl32.lib crypt32.lib bcrypt.lib
+set LIBS=user32.lib gdi32.lib shell32.lib ole32.lib uuid.lib comctl32.lib crypt32.lib bcrypt.lib advapi32.lib
 
 rc /nologo /fo build\apk_signer.res apk_signer.rc || exit /b 1
 cl %COMMON% /W3 /c third_party\miniz\miniz.c || exit /b 1

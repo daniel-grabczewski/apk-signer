@@ -110,6 +110,21 @@ body {
 .option input { flex: none; width: 18px; height: 18px; margin: 2px 0 0; accent-color: var(--green-button); cursor: inherit; }
 .option-title { display: block; font-size: 14px; font-weight: 600; }
 .option-hint { display: block; font-size: 13px; color: var(--muted); }
+.copy-name { margin: 8px 0 0 28px; }
+.copy-name input {
+  width: 100%;
+  max-width: 320px;
+  padding: 7px 10px;
+  border: 1px solid var(--dash);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+}
+.copy-name input:focus-visible { outline: 3px solid var(--focus); outline-offset: 1px; border-color: var(--green); }
+.copy-name input:disabled { opacity: 0.6; }
+.copy-name .option-hint { margin: 4px 0 0; }
 
 .progress { width: min(320px, 100%); margin: 16px auto 0; }
 .track { height: 6px; overflow: hidden; border-radius: 3px; background: var(--track); }

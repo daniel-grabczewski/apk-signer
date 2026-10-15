@@ -12,3 +12,5 @@
 #define IDC_ANOTHER      204
 #define IDC_COPY         205
 #define IDC_COPY_HINT    206
+#define IDC_COPY_NAME    207
+#define IDC_COPY_NAME_LABEL 208

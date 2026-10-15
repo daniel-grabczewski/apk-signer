@@ -505,11 +505,43 @@ async function signingBlock(digest, key) {
 // be unique per app (provider authorities and the app's own permissions); class names stay put, so
 // the code runs unchanged. The label gets the time, so the copies can be told apart on the
 // launcher, and resources.arsc takes the new package name too, so lookups by name keep working.
+//
+// An unnamed copy's package comes from the time, so each one is a new app. A named copy's comes
+// from its name, so signing another build with the same name gives the same package, which Android
+// installs as an update of that copy, keeping its data. Its version code comes from the time, so
+// the build signed last is always accepted, whatever version codes the builds themselves carry.
 
+export const COPY_NAME_LIMIT = 40;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const PERMISSION_ELEMENTS = new Set(['permission', 'permission-group', 'permission-tree', 'uses-permission', 'uses-permission-sdk-23']);
 const PERMISSION_ATTRIBUTES = new Set(['permission', 'readPermission', 'writePermission', 'taskAffinity']);
+const COPY_PACKAGE = /\.(c\d{14}|copy_[a-z0-9_]+)$/;  // what makeSeparateCopy appends
 const pad2 = (n) => String(n).padStart(2, '0');
+
+// A copy's name as shown: runs of spaces and line breaks become one space, ends trimmed.
+export function normalizeCopyName(name) {
+  return String(name ?? '').replace(/[ \t\r\n]+/g, ' ').replace(/^ | $/g, '');
+}
+
+// What a named copy's package name is made from, so the same name always gives the same package:
+// "Daniel's testing" -> "daniels_testing". Letters and digits are kept in lower case, apostrophes
+// are dropped and anything else separates words. A name with other characters also gets a
+// checksum, so names that differ only in those still give different packages.
+export function copyNameSlug(name) {
+  const key = normalizeCopyName(name).replace(/[A-Z]/g, (c) => c.toLowerCase()).replace(/['’]/g, '');
+  const slug = key.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  if (slug && !/[^\x00-\x7f]/.test(key)) return slug;
+  const sum = crc32(encoder.encode(key)).toString(16).padStart(8, '0');
+  return slug ? `${slug}_${sum}` : sum;
+}
+
+// Seconds from 2020-01-01 00:00 to `when`, both read as local clock time: a named copy's version
+// code, which grows with every copy made.
+function copyVersionCode(when) {
+  const seconds = (y, mo, d, h, mi, s) => Date.UTC(y, mo, d, h, mi, s) / 1000;
+  return seconds(when.getFullYear(), when.getMonth(), when.getDate(), when.getHours(), when.getMinutes(), when.getSeconds())
+    - seconds(2020, 0, 1, 0, 0, 0);
+}
 
 function readStringPool(b, start) {
   const headerSize = u16(b, start + 2);
@@ -657,9 +689,10 @@ function defaultEntryString(arsc, q, index, values) {
   return type === 0x03 && values ? values[data] ?? null : null;
 }
 
-// Rewrites the binary AndroidManifest.xml for a copy. Returns the new manifest, the old and new
-// package names, and the app's new label.
-function rewriteManifest(axml, arsc, newPackageFor, newLabelFor) {
+// Rewrites the binary AndroidManifest.xml for a copy: packageFor and labelFor give the new package
+// name and label from the old ones, and versionCode, when set, replaces the version code. Returns
+// the new manifest, the old and new package names, and the app's new label.
+function rewriteManifest(axml, arsc, { packageFor, labelFor, versionCode = null }) {
   const broken = () => new ApkError('Its AndroidManifest.xml is not in the expected binary format.');
   if (axml.length < 8 || u16(axml, 0) !== 0x0003) throw broken();
   const poolStart = u16(axml, 2);
@@ -690,7 +723,8 @@ function rewriteManifest(axml, arsc, newPackageFor, newLabelFor) {
   const manifest = elements.find((e) => e.name === 'manifest');
   const from = manifest?.attributes.find((a) => a.name === 'package')?.value;
   if (!from) throw broken();
-  const to = newPackageFor(from);
+  if (COPY_PACKAGE.test(from)) throw new ApkError('That APK is already a separate copy. Make copies from the original APK.');
+  const to = packageFor(from);
   if (to.length > 127) throw new ApkError('That package name is too long to make a copy of.');
   const rename = (v) => (v === from ? to : v.startsWith(`${from}.`) ? to + v.slice(from.length) : v);
 
@@ -709,15 +743,24 @@ function rewriteManifest(axml, arsc, newPackageFor, newLabelFor) {
     out[a.at + 15] = 0x03;
     put32(out, a.at + 16, index);
   };
+  const setNumber = (a, value) => {
+    put32(out, a.at + 8, 0xffffffff);  // no raw string
+    put16(out, a.at + 12, 8);
+    out[a.at + 14] = 0;
+    out[a.at + 15] = 0x10;  // typed value: a decimal integer
+    put32(out, a.at + 16, value);
+  };
 
   let label = null;
   for (const element of elements) {
     for (const a of element.attributes) {
       if (element === manifest && a.name === 'package') {
         set(a, to);
+      } else if (element === manifest && versionCode !== null && (a.name === 'versionCode' || a.name === 'versionCodeMajor')) {
+        setNumber(a, a.name === 'versionCode' ? versionCode : 0);
       } else if (a.name === 'label' && (element.name === 'application' || launchers.has(element))) {
         const text = a.value ?? (a.type === 0x01 && arsc ? resolveString(arsc, a.data) : null) ?? from;
-        const next = newLabelFor(text);
+        const next = labelFor(text);
         set(a, next);
         if (element.name === 'application' || !label) label = next;
       } else if (a.value !== null) {
@@ -764,20 +807,26 @@ async function replaceContent(b, e, plain) {
   e.compressedSize = data.length;
 }
 
-async function makeSeparateCopy(b, entries, when) {
+// `name` is a normalized copy name, or '' for an unnamed copy.
+async function makeSeparateCopy(b, entries, when, name) {
   const stamp = `${when.getFullYear()}${pad2(when.getMonth() + 1)}${pad2(when.getDate())}`
     + `${pad2(when.getHours())}${pad2(when.getMinutes())}${pad2(when.getSeconds())}`;
   // The time goes before the date: launchers cut long labels at the end, and the time is what
   // tells copies made on the same day apart.
-  const shown = `${pad2(when.getHours())}:${pad2(when.getMinutes())}:${pad2(when.getSeconds())} ${when.getDate()} ${MONTHS[when.getMonth()]}`;
+  const time = `${pad2(when.getHours())}:${pad2(when.getMinutes())}:${pad2(when.getSeconds())} ${when.getDate()} ${MONTHS[when.getMonth()]}`;
+  const shown = name ? `${name} ${time}` : time;
+  const suffix = name ? `copy_${copyNameSlug(name)}` : `c${stamp}`;
   const manifestEntry = entries.find((e) => e.name === 'AndroidManifest.xml');
   const arscEntry = entries.find((e) => e.name === 'resources.arsc');
   const arsc = arscEntry ? await plainContent(b, arscEntry) : null;
-  const rewritten = rewriteManifest(await plainContent(b, manifestEntry), arsc,
-    (name) => `${name}.c${stamp}`, (label) => `${label} ${shown}`);
+  const rewritten = rewriteManifest(await plainContent(b, manifestEntry), arsc, {
+    packageFor: (pkg) => `${pkg}.${suffix}`,
+    labelFor: (label) => `${label} ${shown}`,
+    versionCode: name ? copyVersionCode(when) : null,
+  });
   await replaceContent(b, manifestEntry, rewritten.manifest);
   if (arsc) await replaceContent(b, arscEntry, renameResourcePackage(arsc, rewritten.from, rewritten.to));
-  return { packageName: rewritten.to, label: rewritten.label };
+  return { packageName: rewritten.to, label: rewritten.label, name: name || null };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -793,14 +842,17 @@ export async function inspectApk(file) {
 }
 
 // Signs an APK (ArrayBuffer or Uint8Array). onProgress receives a fraction between 0 and 1.
-// With copyAt (a Date), the APK is also turned into a separate copy made at that time.
-// Returns { apk: the signed APK as a Uint8Array, copy: null or { packageName, label } }.
-export async function signApk(input, onProgress = () => {}, { copyAt = null } = {}) {
+// With copyAt (a Date), the APK is also turned into a separate copy made at that time, and
+// copyName, if given, names it so that a later copy with the same name updates this one.
+// Returns { apk: the signed APK as a Uint8Array, copy: null or { packageName, label, name } }.
+export async function signApk(input, onProgress = () => {}, { copyAt = null, copyName = '' } = {}) {
   const b = input instanceof Uint8Array ? input : new Uint8Array(input);
   const end = findEnd(b, b.length);
   const entries = readEntries(b.subarray(end.cdOffset, end.eocd));
   checkEntries(entries);
-  const copy = copyAt ? await makeSeparateCopy(b, entries, copyAt) : null;
+  const name = normalizeCopyName(copyName);
+  if (name.length > COPY_NAME_LIMIT) throw new ApkError(`A copy's name can be at most ${COPY_NAME_LIMIT} characters.`);
+  const copy = copyAt ? await makeSeparateCopy(b, entries, copyAt, name) : null;
   const kept = entries.filter((e) => !isSignatureFile(e.name));
   const key = await crypto.subtle.importKey('pkcs8', fromBase64(PRIVATE_KEY_PKCS8), RSA, false, ['sign']);
 

@@ -50,6 +50,12 @@
         <span class="option-hint">Installs alongside the original, named with the time it was made.</span>
       </span>
     </label>
+    <div id="copy-name-row" class="copy-name" hidden>
+      <input id="copy-name" type="text" maxlength="40" placeholder="Name (optional)" aria-label="Copy name (optional)"
+        aria-describedby="copy-name-hint" list="copy-names" autocomplete="off" spellcheck="false">
+      <datalist id="copy-names"></datalist>
+      <p id="copy-name-hint" class="option-hint">Reuse a name later to update that copy and keep its data.</p>
+    </div>
 
     <footer class="actions">
       <p id="status" class="status" role="status"></p>

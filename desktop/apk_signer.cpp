@@ -968,14 +968,100 @@ std::wstring InspectApk(const std::wstring& path, uint64_t& size) {
 // be unique per app (provider authorities and the app's own permissions); class names stay put, so
 // the code runs unchanged. The label gets the time, so the copies can be told apart on the
 // launcher, and resources.arsc takes the new package name too, so lookups by name keep working.
+//
+// An unnamed copy's package comes from the time, so each one is a new app. A named copy's comes
+// from its name, so signing another build with the same name gives the same package, which Android
+// installs as an update of that copy, keeping its data. Its version code comes from the time, so
+// the build signed last is always accepted, whatever version codes the builds themselves carry.
 
 struct CopyInfo {
-    std::wstring packageName;  // both empty when the APK was signed as it is
+    std::wstring packageName;  // all empty when the APK was signed as it is
     std::wstring label;
+    std::wstring name;         // a named copy's name
 };
 
+// What a copy is asked to be: when it is made and, for a named copy, its name.
+struct CopyRequest {
+    SYSTEMTIME at{};
+    std::wstring name;
+};
+
+constexpr size_t kCopyNameLimit = 40;
 const wchar_t* const kMonths[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun",
                                   L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+
+// A copy's name as shown: runs of spaces and line breaks become one space, ends trimmed.
+std::wstring NormalizeCopyName(const std::wstring& name) {
+    std::wstring out;
+    bool space = false;
+    for (const wchar_t c : name) {
+        if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n') {
+            space = !out.empty();
+            continue;
+        }
+        if (space) out += L' ';
+        space = false;
+        out += c;
+    }
+    return out;
+}
+
+// What a named copy's package name is made from, so the same name always gives the same package:
+// "Daniel's testing" -> "daniels_testing". Letters and digits are kept in lower case, apostrophes
+// are dropped and anything else separates words. A name with other characters also gets a
+// checksum, so names that differ only in those still give different packages.
+std::wstring CopyNameSlug(const std::wstring& name) {
+    std::wstring key;
+    for (const wchar_t c : NormalizeCopyName(name)) {
+        if (c == L'\'' || c == 0x2019) continue;
+        key += (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c - L'A' + L'a') : c;
+    }
+    std::wstring slug;
+    bool gap = false, other = false;
+    for (const wchar_t c : key) {
+        if ((c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9')) {
+            if (gap && !slug.empty()) slug += L'_';
+            slug += c;
+            gap = false;
+        } else {
+            gap = true;
+            other = other || c > 0x7f;
+        }
+    }
+    if (!slug.empty() && !other) return slug;
+    const std::string bytes = Narrow(key);
+    wchar_t sum[16];
+    swprintf_s(sum, L"%08lx", mz_crc32(MZ_CRC32_INIT, reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size()));
+    return slug.empty() ? std::wstring(sum) : slug + L"_" + sum;
+}
+
+// Whether a package name is already a copy's: it ends in ".c" and 14 digits, or ".copy_" and a name.
+bool IsCopyPackage(const std::wstring& name) {
+    const size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+    const std::wstring last = name.substr(dot + 1);
+    const auto digit = [](wchar_t c) { return c >= L'0' && c <= L'9'; };
+    const auto slugChar = [&](wchar_t c) { return (c >= L'a' && c <= L'z') || digit(c) || c == L'_'; };
+    if (last.size() == 15 && last[0] == L'c' && std::all_of(last.begin() + 1, last.end(), digit)) return true;
+    return last.size() > 5 && last.compare(0, 5, L"copy_") == 0 && std::all_of(last.begin() + 5, last.end(), slugChar);
+}
+
+// Seconds from 2020-01-01 00:00 to `when`, both read as local clock time: a named copy's version
+// code, which grows with every copy made.
+uint32_t CopyVersionCode(const SYSTEMTIME& when) {
+    auto seconds = [](SYSTEMTIME t) {
+        t.wDayOfWeek = 0;
+        t.wMilliseconds = 0;
+        FILETIME f{};
+        SystemTimeToFileTime(&t, &f);
+        return ((uint64_t{f.dwHighDateTime} << 32) | f.dwLowDateTime) / 10000000;
+    };
+    SYSTEMTIME start{};
+    start.wYear = 2020;
+    start.wMonth = 1;
+    start.wDay = 1;
+    return static_cast<uint32_t>(seconds(when) - seconds(start));
+}
 
 // Whether b has n bytes from p on.
 bool Within(Bytes b, uint64_t p, uint64_t n) { return p <= b.n && n <= b.n - p; }
@@ -1204,10 +1290,10 @@ struct Rewrite {
     std::wstring from, to, label;  // the old and new package names, and the app's new label
 };
 
-// Rewrites the binary AndroidManifest.xml for a copy: the package becomes "<package>.c<stamp>" and
-// the app's label gets `shown` added.
-bool RewriteManifest(Bytes axml, Bytes arsc, const std::wstring& stamp, const std::wstring& shown, Rewrite& out,
-                     std::wstring& problem) {
+// Rewrites the binary AndroidManifest.xml for a copy: the package becomes "<package>.<suffix>", the
+// app's label gets `shown` added, and a versionCode other than 0 replaces the version code.
+bool RewriteManifest(Bytes axml, Bytes arsc, const std::wstring& suffix, const std::wstring& shown,
+                     uint32_t versionCode, Rewrite& out, std::wstring& problem) {
     problem = L"Its AndroidManifest.xml is not in the expected binary format.";
     if (!Within(axml, 0, 8) || Le16(axml.p) != 0x0003) return false;
     const uint64_t poolStart = Le16(axml.p + 2);
@@ -1245,7 +1331,11 @@ bool RewriteManifest(Bytes axml, Bytes arsc, const std::wstring& stamp, const st
     for (const XmlAttribute& a : elements[manifest].attributes)
         if (a.name == L"package" && a.value) out.from = *a.value;
     if (out.from.empty()) return false;
-    out.to = out.from + L".c" + stamp;
+    if (IsCopyPackage(out.from)) {
+        problem = L"That APK is already a separate copy. Make copies from the original APK.";
+        return false;
+    }
+    out.to = out.from + L"." + suffix;
     if (out.to.size() > 127) {
         problem = L"That package name is too long to make a copy of.";
         return false;
@@ -1274,12 +1364,22 @@ bool RewriteManifest(Bytes axml, Bytes arsc, const std::wstring& stamp, const st
         p[15] = 0x03;
         Put32(p + 16, static_cast<uint32_t>(index));
     };
+    auto setNumber = [&](const XmlAttribute& a, uint32_t value) {
+        uint8_t* p = result.data() + a.at;
+        Put32(p + 8, 0xffffffff);  // no raw string
+        Put16(p + 12, 8);
+        p[14] = 0;
+        p[15] = 0x10;  // typed value: a decimal integer
+        Put32(p + 16, value);
+    };
 
     for (size_t i = 0; i < elements.size(); ++i) {
         const XmlElement& element = elements[i];
         for (const XmlAttribute& a : element.attributes) {
             if (i == manifest && a.name == L"package") {
                 set(a, out.to);
+            } else if (i == manifest && versionCode && (a.name == L"versionCode" || a.name == L"versionCodeMajor")) {
+                setNumber(a, a.name == L"versionCode" ? versionCode : 0);
             } else if (a.name == L"label" && (element.name == L"application" || launchers.count(i))) {
                 std::wstring text;
                 if (a.value)
@@ -1371,8 +1471,10 @@ std::wstring CopyStamp(const SYSTEMTIME& when, bool forFileName) {
     return text;
 }
 
+// `request.name` is a normalized copy name, or empty for an unnamed copy.
 bool MakeSeparateCopy(const MappedFile& input, const ZipLayout& zip, std::vector<ZipEntry>& entries,
-                      const SYSTEMTIME& when, CopyInfo& copy, std::wstring& problem) {
+                      const CopyRequest& request, CopyInfo& copy, std::wstring& problem) {
+    const SYSTEMTIME& when = request.at;
     ZipEntry* manifest = nullptr;
     ZipEntry* table = nullptr;
     for (ZipEntry& e : entries) {
@@ -1391,11 +1493,15 @@ bool MakeSeparateCopy(const MappedFile& input, const ZipLayout& zip, std::vector
 
     // The time goes before the date: launchers cut long labels at the end, and the time is what
     // tells copies made on the same day apart.
-    wchar_t shown[48];
-    swprintf_s(shown, L"%02u:%02u:%02u %u %ls", unsigned{when.wHour}, unsigned{when.wMinute}, unsigned{when.wSecond},
+    wchar_t time[48];
+    swprintf_s(time, L"%02u:%02u:%02u %u %ls", unsigned{when.wHour}, unsigned{when.wMinute}, unsigned{when.wSecond},
                unsigned{when.wDay}, kMonths[when.wMonth - 1]);
+    const bool named = !request.name.empty();
+    const std::wstring shown = named ? request.name + L" " + time : time;
+    const std::wstring suffix = named ? L"copy_" + CopyNameSlug(request.name) : L"c" + CopyStamp(when, false);
     Rewrite rewrite;
-    if (!RewriteManifest(manifestContent, tableContent, CopyStamp(when, false), shown, rewrite, problem)) return false;
+    if (!RewriteManifest(manifestContent, tableContent, suffix, shown, named ? CopyVersionCode(when) : 0, rewrite, problem))
+        return false;
     ByteVec renamedTable;
     if (table) {
         renamedTable.assign(tableContent.p, tableContent.p + tableContent.n);
@@ -1408,6 +1514,7 @@ bool MakeSeparateCopy(const MappedFile& input, const ZipLayout& zip, std::vector
     }
     copy.packageName = rewrite.to;
     copy.label = rewrite.label;
+    copy.name = request.name;
     return true;
 }
 
@@ -1458,8 +1565,9 @@ bool WriteAll(const std::wstring& path, std::initializer_list<Bytes> parts) {
     return ok;
 }
 
-// With copyAt, the APK is also turned into a separate copy made at that time.
-Outcome SignApk(const std::wstring& inputPath, const std::wstring& outputPath, const SYSTEMTIME* copyAt = nullptr) {
+// With copyRequest, the APK is also turned into a separate copy: made at its time and, if it has a
+// name, named so that a later copy with the same name updates this one.
+Outcome SignApk(const std::wstring& inputPath, const std::wstring& outputPath, const CopyRequest* copyRequest = nullptr) {
     MappedFile input;
     if (!input.Open(inputPath)) return Failed(L"Could not read the APK.", ErrorText(GetLastError()));
     ZipLayout zip;
@@ -1480,7 +1588,11 @@ Outcome SignApk(const std::wstring& inputPath, const std::wstring& outputPath, c
 
     std::wstring problem;
     CopyInfo copy;
-    if (copyAt && !MakeSeparateCopy(input, zip, kept, *copyAt, copy, problem)) return Failed(problem);
+    if (copyRequest) {
+        const CopyRequest request{copyRequest->at, NormalizeCopyName(copyRequest->name)};
+        if (request.name.size() > kCopyNameLimit) return Failed(L"A copy's name can be at most 40 characters.");
+        if (!MakeSeparateCopy(input, zip, kept, request, copy, problem)) return Failed(problem);
+    }
     std::vector<JarFile> jarFiles;
     if (!JarSignature(input, zip, kept, key, cert, fields, jarFiles, problem)) return Failed(problem);
     for (const JarFile& file : jarFiles) {
@@ -1532,12 +1644,12 @@ struct Job {
     std::wstring input;
     std::wstring output;
     bool copy;
-    SYSTEMTIME copyAt;
+    CopyRequest request;
 };
 
 DWORD WINAPI SignThread(void* param) {
     Job* job = static_cast<Job*>(param);
-    auto* outcome = new Outcome(SignApk(job->input, job->output, job->copy ? &job->copyAt : nullptr));
+    auto* outcome = new Outcome(SignApk(job->input, job->output, job->copy ? &job->request : nullptr));
     if (!PostMessageW(job->dialog, WM_APP_DONE, 0, reinterpret_cast<LPARAM>(outcome))) delete outcome;
     delete job;
     return 0;
@@ -1559,18 +1671,70 @@ struct State {
     uint64_t apkSize = 0;
     std::wstring saved;    // the signed APK last written
     uint64_t savedSize = 0;
-    std::wstring savedLabel;  // what it installs as, when it is a separate copy
+    CopyInfo savedCopy;    // what it installs as, when it is a separate copy
     std::wstring pending;  // an APK given on the command line (or dropped on the exe's icon)
     bool busy = false;
     Tone tone = Tone::Normal;
 } g;
 
 constexpr wchar_t kIdleHint[] = L"Signs with the Android debug key.";
+constexpr wchar_t kCopyHint[] = L"Installs alongside the original, named with the time it was made.";
+constexpr wchar_t kNameHint[] = L"Reuse a name later to update that copy and keep its data.";
 constexpr COLORREF kGreen = RGB(46, 164, 79);
 constexpr COLORREF kSuccessText = RGB(16, 124, 16);
 constexpr COLORREF kSuccessTint = RGB(237, 247, 240);
 
 HWND Item(int id) { return GetDlgItem(g.dialog, id); }
+
+std::wstring WindowText(HWND window) {
+    std::wstring text(static_cast<size_t>(GetWindowTextLengthW(window)), L'\0');
+    if (!text.empty()) text.resize(static_cast<size_t>(GetWindowTextW(window, text.data(), static_cast<int>(text.size() + 1))));
+    return text;
+}
+
+// The success view's line about a copy.
+std::wstring CopyNote(const CopyInfo& copy) {
+    return copy.name.empty() ? L"Installs alongside the original as “" + copy.label + L"”"
+                             : L"Installs as “" + copy.label + L"”";
+}
+
+// Copy names used before, newest first, offered in the name box. Kept in HKCU\Software\APK Signer.
+constexpr wchar_t kSettingsKey[] = L"Software\\APK Signer";
+constexpr wchar_t kNamesValue[] = L"CopyNames";
+
+std::vector<std::wstring> SavedNames() {
+    std::vector<std::wstring> names;
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kNamesValue, RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS)
+        return names;
+    std::wstring buffer(size / sizeof(wchar_t) + 2, L'\0');
+    size = static_cast<DWORD>(buffer.size() * sizeof(wchar_t));
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, kNamesValue, RRF_RT_REG_MULTI_SZ, nullptr, buffer.data(), &size) != ERROR_SUCCESS)
+        return names;
+    for (const wchar_t* p = buffer.c_str(); *p; p += wcslen(p) + 1) names.emplace_back(p);
+    return names;
+}
+
+void ShowNames(const std::vector<std::wstring>& names) {
+    HWND box = Item(IDC_COPY_NAME);
+    const std::wstring typed = WindowText(box);  // CB_RESETCONTENT empties the edit part too
+    SendMessageW(box, CB_RESETCONTENT, 0, 0);
+    for (const std::wstring& name : names) SendMessageW(box, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name.c_str()));
+    SetWindowTextW(box, typed.c_str());
+}
+
+// Names that make the same package are the same copy, so only the latest spelling is kept.
+void RememberName(const std::wstring& name) {
+    std::vector<std::wstring> names{name};
+    for (const std::wstring& other : SavedNames())
+        if (names.size() < 10 && CopyNameSlug(other) != CopyNameSlug(name)) names.push_back(other);
+    std::wstring data;
+    for (const std::wstring& each : names) data += each + L'\0';
+    data += L'\0';
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, kNamesValue, REG_MULTI_SZ, data.c_str(),
+                    static_cast<DWORD>(data.size() * sizeof(wchar_t)));
+    ShowNames(names);
+}
 
 void SetStatus(const std::wstring& text, Tone tone) {
     g.tone = tone;
@@ -1592,6 +1756,12 @@ void UpdateControls() {
     ShowWindow(Item(IDC_STATUS), done ? SW_HIDE : SW_SHOW);
     ShowWindow(Item(IDC_LINK), done ? SW_SHOW : SW_HIDE);
     SendMessageW(g.dialog, DM_SETDEFID, done ? IDC_ANOTHER : IDOK, 0);
+    // The name box is only there for a copy.
+    const bool copy = IsDlgButtonChecked(g.dialog, IDC_COPY) == BST_CHECKED;
+    ShowWindow(Item(IDC_COPY_NAME_LABEL), copy ? SW_SHOW : SW_HIDE);
+    ShowWindow(Item(IDC_COPY_NAME), copy ? SW_SHOW : SW_HIDE);
+    EnableWindow(Item(IDC_COPY_NAME), !g.busy);
+    SetWindowTextW(Item(IDC_COPY_HINT), copy ? kNameHint : kCopyHint);
 
     // The box draws its own content, so its window text is only what screen readers (and UI
     // tests) see.
@@ -1602,7 +1772,7 @@ void UpdateControls() {
         text = FileName(g.apk) + L", " + FormatSize(g.apkSize) + L", in " + Folder(g.apk);
     else
         text = L"Signed successfully: " + FileName(g.saved) + L", " + FormatSize(g.savedSize) + L", saved in " +
-               Folder(g.saved) + (g.savedLabel.empty() ? L"" : L". Installs alongside the original as " + g.savedLabel);
+               Folder(g.saved) + (g.savedCopy.label.empty() ? L"" : L". " + CopyNote(g.savedCopy));
     SetWindowTextW(Item(IDC_DROP), text.c_str());
     InvalidateRect(Item(IDC_DROP), nullptr, TRUE);
 }
@@ -1698,11 +1868,16 @@ void StartSigning() {
     if (g.busy || g.view != View::Ready) return;
     // A copy is named after the moment Sign was pressed, in its file name and on the device.
     const bool copy = IsDlgButtonChecked(g.dialog, IDC_COPY) == BST_CHECKED;
-    SYSTEMTIME now{};
-    GetLocalTime(&now);
-    const std::wstring output = AskWhereToSave(SignedName(g.apk, copy ? L"-COPY-" + CopyStamp(now, true) : L""));
+    CopyRequest request;
+    GetLocalTime(&request.at);
+    std::wstring tag;
+    if (copy) {
+        request.name = NormalizeCopyName(WindowText(Item(IDC_COPY_NAME)));
+        tag = L"-COPY-" + (request.name.empty() ? L"" : CopyNameSlug(request.name) + L"-") + CopyStamp(request.at, true);
+    }
+    const std::wstring output = AskWhereToSave(SignedName(g.apk, tag));
     if (output.empty()) return;
-    auto* job = new Job{g.dialog, g.apk, output, copy, now};
+    auto* job = new Job{g.dialog, g.apk, output, copy, request};
     HANDLE thread = CreateThread(nullptr, 0, SignThread, job, 0, nullptr);
     if (!thread) {
         delete job;
@@ -1720,7 +1895,8 @@ void OnSigned(Outcome* outcome) {
         // From here on only the signed APK matters, so the original is let go.
         g.saved = outcome->output;
         g.savedSize = outcome->size;
-        g.savedLabel = outcome->copy.label;
+        g.savedCopy = outcome->copy;
+        if (!outcome->copy.name.empty()) RememberName(outcome->copy.name);
         g.apk.clear();
         ShowView(View::Signed);
     } else {
@@ -1865,9 +2041,7 @@ void DrawDropZone(const DRAWITEMSTRUCT& item) {
         lines = {{L"Signed successfully", headline, kSuccessText, 0, 0}};
         addName(FileName(g.saved), px(4));
         lines.push_back({FormatSize(g.savedSize) + L"  ·  " + Folder(g.saved), body, grey, DT_PATH_ELLIPSIS, px(14)});
-        if (!g.savedLabel.empty())
-            lines.push_back({L"Installs alongside the original as “" + g.savedLabel + L"”", body, grey,
-                             DT_END_ELLIPSIS, px(6)});
+        if (!g.savedCopy.label.empty()) lines.push_back({CopyNote(g.savedCopy), body, grey, DT_END_ELLIPSIS, px(6)});
     }
 
     SetBkMode(dc, TRANSPARENT);
@@ -1929,6 +2103,9 @@ INT_PTR CALLBACK DialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
         ChangeWindowMessageFilterEx(dialog, WM_DROPFILES, MSGFLT_ALLOW, nullptr);
         ChangeWindowMessageFilterEx(dialog, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
         ChangeWindowMessageFilterEx(dialog, 0x0049 /* WM_COPYGLOBALDATA */, MSGFLT_ALLOW, nullptr);
+        SendMessageW(Item(IDC_COPY_NAME), CB_LIMITTEXT, kCopyNameLimit, 0);
+        SendMessageW(Item(IDC_COPY_NAME), CB_SETCUEBANNER, 0, reinterpret_cast<LPARAM>(L"optional"));
+        ShowNames(SavedNames());
         ShowView(View::Empty);
         if (!g.pending.empty()) SelectApk(g.pending);
         return FALSE;  // focus is already set
@@ -1947,6 +2124,12 @@ INT_PTR CALLBACK DialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
             return TRUE;
         case IDC_ANOTHER:
             if (!g.busy) ShowView(View::Empty);
+            return TRUE;
+        case IDC_COPY:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                UpdateControls();
+                if (IsDlgButtonChecked(dialog, IDC_COPY) == BST_CHECKED) Focus(IDC_COPY_NAME);
+            }
             return TRUE;
         case IDCANCEL:
             if (g.busy)

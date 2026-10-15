@@ -6,11 +6,12 @@ Sign an Android APK with the Android debug key, in two forms:
   **Sign**, and the signed APK downloads. It runs entirely in your browser; the APK is never
   uploaded anywhere.
 - **Windows:** [`APK-Signer.exe`](https://github.com/daniel-grabczewski/apk-signer/releases/latest),
-  one native file of about 340 KB with no installer and no runtimes. Drop an APK on the window,
+  one native file of about 350 KB with no installer and no runtimes. Drop an APK on the window,
   press **Sign**, and choose where to save.
 
 Either way the signed file is named `<name>-SIGNED.apk`. Tick **Separate copy** first to get an APK
-that installs alongside the original instead of over it (see [Separate copies](#separate-copies)).
+that installs alongside the original instead of over it, and give the copy a name if you want to
+update it with later builds (see [Separate copies](#separate-copies)).
 
 ## What it writes
 
@@ -26,6 +27,10 @@ are replaced, so an APK that is already signed simply gets re-signed. (A separat
 get it: the v2 signature must verify with the expected certificate, and the file must be
 zip-aligned.
 
+Both versions were tested against Google's `apksig` verifier on real-world APKs up to 122 MB,
+including apps with a minimum SDK of 21 (v1 and v2 both verified) and apps with uncompressed
+native libraries.
+
 ## Separate copies
 
 Android tells apps apart by their package name, not by their signature. An APK signed with a
@@ -35,25 +40,37 @@ name.
 
 With **Separate copy** ticked, the signer also:
 
-- gives the app a new package name: `<package>.c<yyyyMMddHHmmss>`, for example
-  `com.example.app.c20261016114748`,
+- gives the app a new package name (see below),
 - renames what Android requires to be unique per app: content provider authorities and the app's
   own permissions that start with the old package name,
 - adds the time it was made to the app's name, for example `My App 11:47:48 16 Oct`, so the copies
   can be told apart. The time comes first because launchers cut long names at the end,
 - records the new package name in `resources.arsc`.
 
-Class names are left alone, so the code runs unchanged. Each copy keeps its own data and starts out
-like a fresh install. The file is named `<name>-COPY-<yyyyMMdd>-<HHmmss>-SIGNED.apk`, matching the
-package name.
+Class names are left alone, so the code runs unchanged. A copy can be unnamed or named:
+
+- **Unnamed** (the name box left empty): every copy is a new app with its own data. Its package is
+  `<package>.c<yyyyMMddHHmmss>` and its file `<name>-COPY-<yyyyMMdd>-<HHmmss>-SIGNED.apk`.
+- **Named**, for example `Alex's phone`: the name goes into the app's name, between the original
+  name and the time (`My App Alex's phone 12:04:57 16 Oct`), and the package is made from the name
+  instead of the time (`<package>.copy_alexs_phone`). Signing another build as a copy with the
+  same name therefore gives the same package, which Android installs as an update of that copy: its
+  data is kept and its name shows the new time. Its file is
+  `<name>-COPY-alexs_phone-<yyyyMMdd>-<HHmmss>-SIGNED.apk`.
+
+Names match loosely: case, apostrophes, spaces and punctuation do not matter, so `Alex's phone` and
+`alexs phone` are the same copy. Both versions remember the names you have used: the web version in
+your browser, the Windows version under `HKCU\Software\APK Signer`.
+
+A named copy's version code is set from the time it was made, so the build you sign last always
+installs over the one before, whatever version codes the builds themselves carry. That includes an
+older build over a newer one's data, which Android would otherwise refuse. The version name the app
+shows is unchanged. An APK that is already a copy is not copied again: make copies from the
+original.
 
 An app that checks its own package name at run time, or relies on a service registered to its
 package name (Google sign-in, Firebase, push notifications, map keys), may not work fully as a
 copy.
-
-Both versions were tested against Google's `apksig` verifier on real-world APKs up to 122 MB,
-including apps with a minimum SDK of 21 (v1 and v2 both verified) and apps with uncompressed
-native libraries.
 
 ## The key
 
@@ -79,7 +96,8 @@ harness that runs the same code:
 
 ```
 selftest sign    <in.apk> <out.apk>
-selftest copy    <in.apk> <out.apk> [yyyy-mm-ddThh:mm:ss]
+selftest copy    <in.apk> <out.apk> [--at yyyy-mm-ddThh:mm:ss] [--name <name>]
+selftest slug    <name>...
 selftest verify  <signed.apk>
 selftest inspect <file>
 ```
